@@ -1,24 +1,18 @@
 #pragma comment(lib, "user32")
 #pragma comment(lib, "d3d11")
 #pragma comment(lib, "d3dcompiler")
+#pragma comment(lib, "windowscodecs")
 
 #include <windows.h>
 #include <d3d11.h>
 #include <d3dcompiler.h>
+#include <wincodec.h>
 
-// 1. Define the triangle vertices
-struct FVertexSimple
+// 텍스처 사각형 정점
+struct FVertexTex
 {
-    float x, y, z;    // Position
-    float r, g, b, a; // Color
-};
-
-// 삼각형을 하드 코딩
-FVertexSimple triangle_vertices[] =
-{
-    {  0.0f,  1.0f, 0.0f,  1.0f, 0.0f, 0.0f, 1.0f }, // Top vertex (red)
-    {  1.0f, -1.0f, 0.0f,  0.0f, 1.0f, 0.0f, 1.0f }, // Bottom-right vertex (green)
-    { -1.0f, -1.0f, 0.0f,  0.0f, 0.0f, 1.0f, 1.0f }  // Bottom-left vertex (blue)
+    float x, y, z;    // Position (NDC)
+    float u, v;       // UV
 };
 
 class URenderer
@@ -42,6 +36,10 @@ public:
     ID3D11PixelShader* SimplePixelShader;
     ID3D11InputLayout* SimpleInputLayout;
     unsigned int Stride;
+
+    // 텍스처 렌더링에 필요한 리소스
+    ID3D11ShaderResourceView* TextureSRV = nullptr;
+    ID3D11SamplerState* TextureSampler = nullptr;
 
 public:
     // 렌더러 초기화 함수
@@ -200,13 +198,13 @@ public:
 
 		D3D11_INPUT_ELEMENT_DESC layout[] =
 		{
-			{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0, D3D11_INPUT_PER_VERTEX_DATA, 0 },
-			{ "COLOR", 0, DXGI_FORMAT_R32G32B32A32_FLOAT, 0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "POSITION", 0, DXGI_FORMAT_R32G32B32_FLOAT, 0, 0,  D3D11_INPUT_PER_VERTEX_DATA, 0 },
+			{ "TEXCOORD", 0, DXGI_FORMAT_R32G32_FLOAT,    0, 12, D3D11_INPUT_PER_VERTEX_DATA, 0 },
 		};
 
 		Device->CreateInputLayout(layout, ARRAYSIZE(layout), vertexshaderCSO->GetBufferPointer(), vertexshaderCSO->GetBufferSize(), &SimpleInputLayout);
 
-		Stride = sizeof(FVertexSimple);
+		Stride = sizeof(FVertexTex);
 
 		vertexshaderCSO->Release();
 		pixelshaderCSO->Release();
@@ -233,6 +231,31 @@ public:
 		}
 	}
 
+    void CreateTextureSampler()
+    {
+        D3D11_SAMPLER_DESC samp{};
+        samp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
+        samp.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
+        samp.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
+        samp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        samp.MaxLOD = D3D11_FLOAT32_MAX;
+        Device->CreateSamplerState(&samp, &TextureSampler);
+    }
+
+    void ReleaseTexture()
+    {
+        if (TextureSampler)
+        {
+            TextureSampler->Release();
+            TextureSampler = nullptr;
+        }
+        if (TextureSRV)
+        {
+            TextureSRV->Release();
+            TextureSRV = nullptr;
+        }
+    }
+
     void Prepare()
     {
         DeviceContext->ClearRenderTargetView(FrameBufferRTV, ClearColor);
@@ -251,6 +274,8 @@ public:
         DeviceContext->VSSetShader(SimpleVertexShader, nullptr, 0);
         DeviceContext->PSSetShader(SimplePixelShader, nullptr, 0);
         DeviceContext->IASetInputLayout(SimpleInputLayout);
+        DeviceContext->PSSetShaderResources(0, 1, &TextureSRV);
+        DeviceContext->PSSetSamplers(0, 1, &TextureSampler);
     }
 
     void RenderPrimitive(ID3D11Buffer* pBuffer, UINT numVertices)
@@ -261,6 +286,68 @@ public:
         DeviceContext->Draw(numVertices, 0);
     }
 };
+// 간단한 WIC 로더: 파일을 32bpp BGRA로 변환해 텍스처/ SRV 생성
+HRESULT CreateTextureFromFileWIC(ID3D11Device* device, ID3D11DeviceContext* context, const wchar_t* path, ID3D11ShaderResourceView** outSRV)
+{
+    *outSRV = nullptr;
+
+    IWICImagingFactory* wicFactory = nullptr;
+    HRESULT hr = CoCreateInstance(CLSID_WICImagingFactory, nullptr, CLSCTX_INPROC_SERVER, IID_PPV_ARGS(&wicFactory));
+    if (FAILED(hr)) return hr;
+
+    IWICBitmapDecoder* decoder = nullptr;
+    hr = wicFactory->CreateDecoderFromFilename(path, nullptr, GENERIC_READ, WICDecodeMetadataCacheOnLoad, &decoder);
+    if (FAILED(hr)) { wicFactory->Release(); return hr; }
+
+    IWICBitmapFrameDecode* frame = nullptr;
+    hr = decoder->GetFrame(0, &frame);
+    if (FAILED(hr)) { decoder->Release(); wicFactory->Release(); return hr; }
+
+    IWICFormatConverter* converter = nullptr;
+    hr = wicFactory->CreateFormatConverter(&converter);
+    if (FAILED(hr)) { frame->Release(); decoder->Release(); wicFactory->Release(); return hr; }
+
+    hr = converter->Initialize(frame, GUID_WICPixelFormat32bppBGRA, WICBitmapDitherTypeNone, nullptr, 0.0, WICBitmapPaletteTypeCustom);
+    if (FAILED(hr)) { converter->Release(); frame->Release(); decoder->Release(); wicFactory->Release(); return hr; }
+
+    UINT width = 0, height = 0;
+    converter->GetSize(&width, &height);
+
+    const UINT stride = width * 4;
+    const UINT imageSize = stride * height;
+    BYTE* pixels = new BYTE[imageSize];
+    hr = converter->CopyPixels(nullptr, stride, imageSize, pixels);
+    if (FAILED(hr)) { delete[] pixels; converter->Release(); frame->Release(); decoder->Release(); wicFactory->Release(); return hr; }
+
+    D3D11_TEXTURE2D_DESC texDesc{};
+    texDesc.Width = width;
+    texDesc.Height = height;
+    texDesc.MipLevels = 1;
+    texDesc.ArraySize = 1;
+    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    texDesc.SampleDesc.Count = 1;
+    texDesc.Usage = D3D11_USAGE_IMMUTABLE;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    D3D11_SUBRESOURCE_DATA init{};
+    init.pSysMem = pixels;
+    init.SysMemPitch = stride;
+
+    ID3D11Texture2D* texture = nullptr;
+    hr = device->CreateTexture2D(&texDesc, &init, &texture);
+    if (SUCCEEDED(hr))
+    {
+        hr = device->CreateShaderResourceView(texture, nullptr, outSRV);
+        texture->Release();
+    }
+
+    delete[] pixels;
+    converter->Release();
+    frame->Release();
+    decoder->Release();
+    wicFactory->Release();
+    return hr;
+}
 
 // 각종 메시지를 처리할 함수
 LRESULT CALLBACK WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam)
@@ -302,6 +389,9 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     ///////////////////////////////////////////////
 	// 각종 생성하는 코드를 여기에 추가.
 
+    // COM 초기화 (WIC 사용)
+    CoInitializeEx(nullptr, COINIT_MULTITHREADED);
+
     // Renderer Class를 생성.
     URenderer renderer;
 
@@ -309,27 +399,30 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     renderer.Create(hWnd);
     renderer.CreateShader();
 
-    // Renderer와 Shader 생성 이후에 버텍스 버퍼를 생성합니다.
-    FVertexSimple* vertices = triangle_vertices;
-    UINT ByteWidth = sizeof(triangle_vertices);
-    UINT numVertices = sizeof(triangle_vertices) / sizeof(FVertexSimple);
+    // 텍스처 로드 및 샘플러 생성
+    renderer.CreateTextureSampler();
+    CreateTextureFromFileWIC(renderer.Device, renderer.DeviceContext, L"Sprites/\
+DnfLoading.jpg", &renderer.TextureSRV);
 
-    float scaleMod = 0.5f;
-
-    for (UINT i = 0; i < numVertices; ++i)
+    // 풀스크린 사각형 정점 버퍼 생성 (TRIANGLELIST 6개 정점)
+    FVertexTex quad[] =
     {
-        triangle_vertices[i].x *= scaleMod;
-        triangle_vertices[i].y *= scaleMod;
-        triangle_vertices[i].z *= scaleMod;
-    }
+        { -1.0f,  1.0f, 0.0f, 0.0f, 0.0f },
+        {  1.0f,  1.0f, 0.0f, 1.0f, 0.0f },
+        {  1.0f, -1.0f, 0.0f, 1.0f, 1.0f },
+        { -1.0f,  1.0f, 0.0f, 0.0f, 0.0f },
+        {  1.0f, -1.0f, 0.0f, 1.0f, 1.0f },
+        { -1.0f, -1.0f, 0.0f, 0.0f, 1.0f },
+    };
 
-    // 생성
+    UINT numVertices = sizeof(quad) / sizeof(FVertexTex);
+
     D3D11_BUFFER_DESC vertexbufferdesc = {};
-    vertexbufferdesc.ByteWidth = ByteWidth;
+    vertexbufferdesc.ByteWidth = sizeof(quad);
     vertexbufferdesc.Usage = D3D11_USAGE_IMMUTABLE;
     vertexbufferdesc.BindFlags = D3D11_BIND_VERTEX_BUFFER;
 
-    D3D11_SUBRESOURCE_DATA vertexbufferSRD = { vertices };
+    D3D11_SUBRESOURCE_DATA vertexbufferSRD = { quad };
 
     ID3D11Buffer* vertexBuffer;
 
@@ -375,8 +468,11 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
     // D3D11 소멸 시키는 함수를 호출.
 
     vertexBuffer->Release();
+    renderer.ReleaseTexture();
     renderer.ReleaseShader();
     renderer.Release();
+
+    CoUninitialize();
 
 	return 0;
 }
