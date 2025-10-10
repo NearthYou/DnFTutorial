@@ -4,6 +4,11 @@
 Texture2D gTexture : register(t0);
 SamplerState gSampler : register(s0);
 
+cbuffer SpriteCB : register(b0)
+{
+    float4 OffsetScale; // x:offsetX, y:offsetY, z:scaleX, w:scaleY
+}
+
 struct VS_INPUT
 {
     float3 position : POSITION;  // xy: NDC(-1..1), z: unused
@@ -19,7 +24,11 @@ struct PS_INPUT
 PS_INPUT mainVS(VS_INPUT input)
 {
     PS_INPUT output;
-    output.position = float4(input.position, 1.0f);
+    // 입력은 NDC 기준 정사각형([-1,1])
+    // 스케일/오프셋을 적용해 화면 위치를 결정
+    float2 scaled = input.position.xy * float2(OffsetScale.z, OffsetScale.w);
+    float2 translated = scaled + OffsetScale.xy;
+    output.position = float4(translated, input.position.z, 1.0f);
     output.uv = input.uv;
     return output;
 }

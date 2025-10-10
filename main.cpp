@@ -7,6 +7,10 @@
 #include <d3d11.h>
 #include <d3dcompiler.h>
 #include <wincodec.h>
+#include <fstream>
+#include <vector>
+#include <cstdint>
+#include <cstdio>
 
 // 텍스처 사각형 정점
 struct FVertexTex
@@ -150,7 +154,7 @@ public:
     {
         D3D11_RASTERIZER_DESC rasterizerdesc = {};
         rasterizerdesc.FillMode = D3D11_FILL_SOLID; // 채우기 모드
-        rasterizerdesc.CullMode = D3D11_CULL_BACK; // 백 페이스 컬링
+        rasterizerdesc.CullMode = D3D11_CULL_NONE; // 풀스크린 사각형은 컬링 비활성화가 안전
 
         Device->CreateRasterizerState(&rasterizerdesc, &RasterizerState);
     }
@@ -234,10 +238,11 @@ public:
     void CreateTextureSampler()
     {
         D3D11_SAMPLER_DESC samp{};
-        samp.Filter = D3D11_FILTER_MIN_MAG_MIP_LINEAR;
-        samp.AddressU = D3D11_TEXTURE_ADDRESS_CLAMP;
-        samp.AddressV = D3D11_TEXTURE_ADDRESS_CLAMP;
-        samp.AddressW = D3D11_TEXTURE_ADDRESS_CLAMP;
+        samp.Filter = D3D11_FILTER_ANISOTROPIC;
+        samp.MaxAnisotropy = 8;
+        samp.AddressU = D3D11_TEXTURE_ADDRESS_WRAP;
+        samp.AddressV = D3D11_TEXTURE_ADDRESS_WRAP;
+        samp.AddressW = D3D11_TEXTURE_ADDRESS_WRAP;
         samp.MaxLOD = D3D11_FLOAT32_MAX;
         Device->CreateSamplerState(&samp, &TextureSampler);
     }
@@ -276,6 +281,7 @@ public:
         DeviceContext->IASetInputLayout(SimpleInputLayout);
         DeviceContext->PSSetShaderResources(0, 1, &TextureSRV);
         DeviceContext->PSSetSamplers(0, 1, &TextureSampler);
+        DeviceContext->VSSetConstantBuffers(0, 1, &ConstantBuffer);
     }
 
     void RenderPrimitive(ID3D11Buffer* pBuffer, UINT numVertices)
@@ -322,22 +328,35 @@ HRESULT CreateTextureFromFileWIC(ID3D11Device* device, ID3D11DeviceContext* cont
     D3D11_TEXTURE2D_DESC texDesc{};
     texDesc.Width = width;
     texDesc.Height = height;
-    texDesc.MipLevels = 1;
+    texDesc.MipLevels = 0; // 전체 밉체인 자동 생성
     texDesc.ArraySize = 1;
     texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
     texDesc.SampleDesc.Count = 1;
-    texDesc.Usage = D3D11_USAGE_IMMUTABLE;
-    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
-
-    D3D11_SUBRESOURCE_DATA init{};
-    init.pSysMem = pixels;
-    init.SysMemPitch = stride;
+    texDesc.Usage = D3D11_USAGE_DEFAULT;
+    texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
+    texDesc.MiscFlags = D3D11_RESOURCE_MISC_GENERATE_MIPS;
 
     ID3D11Texture2D* texture = nullptr;
-    hr = device->CreateTexture2D(&texDesc, &init, &texture);
+    // 밉 자동 생성을 위해 초기 데이터 없이 생성 후, 레벨0을 UpdateSubresource로 채움
+    hr = device->CreateTexture2D(&texDesc, nullptr, &texture);
     if (SUCCEEDED(hr))
     {
-        hr = device->CreateShaderResourceView(texture, nullptr, outSRV);
+        // 레벨0 업로드
+        context->UpdateSubresource(texture, 0, nullptr, pixels, stride, 0);
+
+        // SRV 생성 (전체 밉 사용)
+        D3D11_SHADER_RESOURCE_VIEW_DESC srvDesc{};
+        srvDesc.Format = texDesc.Format;
+        srvDesc.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
+        srvDesc.Texture2D.MostDetailedMip = 0;
+        srvDesc.Texture2D.MipLevels = -1; // 모든 밉
+        hr = device->CreateShaderResourceView(texture, &srvDesc, outSRV);
+        if (SUCCEEDED(hr))
+        {
+            // 밉맵 생성
+            context->GenerateMips(*outSRV);
+        }
+
         texture->Release();
     }
 
@@ -346,6 +365,97 @@ HRESULT CreateTextureFromFileWIC(ID3D11Device* device, ID3D11DeviceContext* cont
     frame->Release();
     decoder->Release();
     wicFactory->Release();
+    return hr;
+}
+
+// 간단한 DDS 로더: DXT1 / DXT5 (BC1/BC3, sRGB)만 지원, 2D 텍스처/미입력 어레이
+HRESULT CreateTextureFromFileDDS(ID3D11Device* device, const wchar_t* path, ID3D11ShaderResourceView** outSRV)
+{
+    *outSRV = nullptr;
+
+    FILE* f = nullptr;
+    if (_wfopen_s(&f, path, L"rb") != 0 || !f) return E_FAIL;
+
+    auto readU32 = [&](uint32_t& v)->bool { return fread(&v, 1, 4, f) == 4; };
+
+    uint32_t magic = 0;
+    if (!readU32(magic)) { fclose(f); return E_FAIL; }
+    if (magic != 0x20534444) { fclose(f); return E_FAIL; } // 'DDS '
+
+    struct DDS_PIXELFORMAT { uint32_t size, flags, fourCC, rgbBitCount, rMask, gMask, bMask, aMask; };
+    struct DDS_HEADER {
+        uint32_t size, flags, height, width, pitchOrLinearSize, depth, mipMapCount;
+        uint32_t reserved1[11];
+        DDS_PIXELFORMAT ddspf;
+        uint32_t caps, caps2, caps3, caps4, reserved2;
+    } header{};
+
+    if (fread(&header, 1, sizeof(header), f) != sizeof(header)) { fclose(f); return E_FAIL; }
+
+    const uint32_t FOURCC_DXT1 = 0x31545844; // 'DXT1'
+    const uint32_t FOURCC_DXT5 = 0x35545844; // 'DXT5'
+
+    DXGI_FORMAT format = DXGI_FORMAT_UNKNOWN;
+    uint32_t blockSize = 0;
+    if (header.ddspf.fourCC == FOURCC_DXT1) { format = DXGI_FORMAT_BC1_UNORM_SRGB; blockSize = 8; }
+    else if (header.ddspf.fourCC == FOURCC_DXT5) { format = DXGI_FORMAT_BC3_UNORM_SRGB; blockSize = 16; }
+    else { fclose(f); return E_FAIL; }
+
+    const uint32_t width = header.width;
+    const uint32_t height = header.height;
+    const uint32_t mipLevels = header.mipMapCount ? header.mipMapCount : 1;
+
+    // 남은 바이너리 전체 읽기
+    fseek(f, 0, SEEK_END);
+    long fileEnd = ftell(f);
+    long dataOffset = 4 + static_cast<long>(sizeof(DDS_HEADER));
+    long dataSizeAll = fileEnd - dataOffset;
+    if (dataSizeAll <= 0) { fclose(f); return E_FAIL; }
+    std::vector<uint8_t> buffer;
+    buffer.resize(static_cast<size_t>(dataSizeAll));
+    fseek(f, dataOffset, SEEK_SET);
+    size_t readBytes = fread(buffer.data(), 1, static_cast<size_t>(dataSizeAll), f);
+    fclose(f);
+    if (readBytes != static_cast<size_t>(dataSizeAll)) return E_FAIL;
+
+    // 서브리소스 구성
+    std::vector<D3D11_SUBRESOURCE_DATA> subs;
+    subs.reserve(mipLevels);
+    size_t offset = 0;
+    uint32_t w = width, h = height;
+    for (uint32_t i = 0; i < mipLevels; ++i)
+    {
+        uint32_t bw = (w + 3) / 4;
+        uint32_t bh = (h + 3) / 4;
+        size_t levelSize = static_cast<size_t>(bw) * static_cast<size_t>(bh) * blockSize;
+        if (offset + levelSize > buffer.size()) return E_FAIL;
+
+        D3D11_SUBRESOURCE_DATA srd{};
+        srd.pSysMem = buffer.data() + offset;
+        srd.SysMemPitch = bw * blockSize;
+        srd.SysMemSlicePitch = 0;
+        subs.push_back(srd);
+
+        offset += levelSize;
+        w = (w > 1) ? (w >> 1) : 1;
+        h = (h > 1) ? (h >> 1) : 1;
+    }
+
+    D3D11_TEXTURE2D_DESC desc{};
+    desc.Width = width;
+    desc.Height = height;
+    desc.MipLevels = mipLevels;
+    desc.ArraySize = 1;
+    desc.Format = format;
+    desc.SampleDesc.Count = 1;
+    desc.Usage = D3D11_USAGE_IMMUTABLE;
+    desc.BindFlags = D3D11_BIND_SHADER_RESOURCE;
+
+    ID3D11Texture2D* tex = nullptr;
+    HRESULT hr = device->CreateTexture2D(&desc, subs.data(), &tex);
+    if (FAILED(hr)) return hr;
+    hr = device->CreateShaderResourceView(tex, nullptr, outSRV);
+    tex->Release();
     return hr;
 }
 
@@ -401,8 +511,22 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // 텍스처 로드 및 샘플러 생성
     renderer.CreateTextureSampler();
-    CreateTextureFromFileWIC(renderer.Device, renderer.DeviceContext, L"Sprites/\
-DnfLoading.jpg", &renderer.TextureSRV);
+    // DDS(BC1/BC3) 로드
+    if (FAILED(CreateTextureFromFileDDS(renderer.Device, L"Sprites/Character.dds", &renderer.TextureSRV)))
+    {
+        // 폴백: 기존 WIC 로더
+        CreateTextureFromFileWIC(renderer.Device, renderer.DeviceContext, L"Sprites/Character.jpg", &renderer.TextureSRV);
+    }
+
+    // 상수 버퍼 생성 (Offset.xy, Scale.xy)
+    {
+        D3D11_BUFFER_DESC cbd{};
+        cbd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
+        cbd.ByteWidth = sizeof(float) * 4;
+        cbd.Usage = D3D11_USAGE_DYNAMIC;
+        cbd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
+        renderer.Device->CreateBuffer(&cbd, nullptr, &renderer.ConstantBuffer);
+    }
 
     // 풀스크린 사각형 정점 버퍼 생성 (TRIANGLELIST 6개 정점)
     FVertexTex quad[] =
@@ -428,7 +552,21 @@ DnfLoading.jpg", &renderer.TextureSRV);
 
     renderer.Device->CreateBuffer(&vertexbufferdesc, &vertexbufferSRD, &vertexBuffer);
 
-	// Main Loop (Quit Message가 들어오기 전까지 아래 Loop를 무한히 실행하게 됨)
+    // 이동/점프 상태 변수
+    float posX = 0.0f;   // NDC 기준 위치
+    float posY = 0.0f;
+    float scaleX = 0.25f; // 화면에서 보이는 스프라이트 크기
+    float scaleY = 0.25f;
+    float velocityY = 0.0f;
+    const float gravity = -2.5f;   // 초당 중력 가속
+    const float jumpSpeed = 1.6f;  // 점프 초기 속도
+    const float moveSpeed = 1.6f;  // 좌우 이동 속도
+
+    // 시간 측정용
+    LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
+    LARGE_INTEGER prev; QueryPerformanceCounter(&prev);
+
+    // Main Loop (Quit Message가 들어오기 전까지 아래 Loop를 무한히 실행하게 됨)
 	while (bIsExit == false)
 	{
 		MSG msg;
@@ -451,6 +589,59 @@ DnfLoading.jpg", &renderer.TextureSRV);
         ///////////////////////////////////////////////
         // // 매번 실행되는 코드를 여기에 추가.
   
+        // deltaTime 계산
+        LARGE_INTEGER now; QueryPerformanceCounter(&now);
+        float dt = float(now.QuadPart - prev.QuadPart) / float(freq.QuadPart);
+        prev = now;
+
+        // 입력 처리
+        SHORT left  = GetAsyncKeyState(VK_LEFT);
+        SHORT right = GetAsyncKeyState(VK_RIGHT);
+        SHORT up    = GetAsyncKeyState(VK_UP);
+        SHORT down  = GetAsyncKeyState(VK_DOWN);
+        SHORT space = GetAsyncKeyState(VK_SPACE);
+
+        if (left & 0x8000)  posX -= moveSpeed * dt;
+        if (right & 0x8000) posX += moveSpeed * dt;
+        if (down & 0x8000)  posY -= moveSpeed * dt;
+        if (up & 0x8000)    posY += moveSpeed * dt;
+
+        // 스페이스 점프(바닥에 있을 때만)
+        bool onGround = (posY - scaleY) <= -1.0f;
+        if (onGround)
+        {
+            posY = -1.0f + scaleY; // 바닥에 스냅
+            velocityY = 0.0f;
+            if (space & 0x8000) velocityY = jumpSpeed;
+        }
+        else
+        {
+            // 중력 적용
+            velocityY += gravity * dt;
+        }
+
+        // 수직 이동에 속도 반영
+        posY += velocityY * dt;
+
+        // 화면 경계(NDC) 클램프: 스케일을 고려해 스프라이트가 화면 밖으로 안 나가도록
+        float halfW = scaleX;
+        float halfH = scaleY;
+        if (posX - halfW < -1.0f) posX = -1.0f + halfW;
+        if (posX + halfW >  1.0f) posX =  1.0f - halfW;
+        if (posY - halfH < -1.0f) posY = -1.0f + halfH;
+        if (posY + halfH >  1.0f) posY =  1.0f - halfH;
+
+        // 상수 버퍼 업데이트(Offset.xy, Scale.xy)
+        {
+            D3D11_MAPPED_SUBRESOURCE mapped{};
+            if (SUCCEEDED(renderer.DeviceContext->Map(renderer.ConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+            {
+                float* cb = (float*)mapped.pData;
+                cb[0] = posX; cb[1] = posY; cb[2] = scaleX; cb[3] = scaleY;
+                renderer.DeviceContext->Unmap(renderer.ConstantBuffer, 0);
+            }
+        }
+
         // 준비 작업
         renderer.Prepare();
         renderer.PrepareShader();
@@ -471,6 +662,7 @@ DnfLoading.jpg", &renderer.TextureSRV);
     renderer.ReleaseTexture();
     renderer.ReleaseShader();
     renderer.Release();
+    if (renderer.ConstantBuffer) { renderer.ConstantBuffer->Release(); renderer.ConstantBuffer = nullptr; }
 
     CoUninitialize();
 
