@@ -11,6 +11,7 @@
 #include <vector>
 #include <cstdint>
 #include <cstdio>
+#include <algorithm>
 
 // 텍스처 사각형 정점
 struct FVertexTex
@@ -19,6 +20,7 @@ struct FVertexTex
     float u, v;       // UV
 };
 
+// URenderer 클래스 (게임 오브젝트들보다 앞에 정의)
 class URenderer
 {
 public:
@@ -42,8 +44,14 @@ public:
     unsigned int Stride;
 
     // 텍스처 렌더링에 필요한 리소스
-    ID3D11ShaderResourceView* TextureSRV = nullptr;
+    ID3D11ShaderResourceView* TextureSRV = nullptr;  // 플레이어 텍스처
+    ID3D11ShaderResourceView* MonsterTextureSRV = nullptr;  // 몬스터 텍스처
+    ID3D11ShaderResourceView* SkillTextureSRV = nullptr;  // 스킬 텍스처
     ID3D11SamplerState* TextureSampler = nullptr;
+    ID3D11BlendState* BlendState = nullptr;  // 투명도 처리를 위한 블렌드 상태
+    
+    // 공통 버텍스 버퍼
+    ID3D11Buffer* VertexBuffer = nullptr;
 
 public:
     // 렌더러 초기화 함수
@@ -247,12 +255,40 @@ public:
         Device->CreateSamplerState(&samp, &TextureSampler);
     }
 
+    void CreateBlendState()
+    {
+        D3D11_BLEND_DESC blendDesc{};
+        blendDesc.AlphaToCoverageEnable = FALSE;
+        blendDesc.IndependentBlendEnable = FALSE;
+        
+        blendDesc.RenderTarget[0].BlendEnable = TRUE;
+        blendDesc.RenderTarget[0].SrcBlend = D3D11_BLEND_SRC_ALPHA;
+        blendDesc.RenderTarget[0].DestBlend = D3D11_BLEND_INV_SRC_ALPHA;
+        blendDesc.RenderTarget[0].BlendOp = D3D11_BLEND_OP_ADD;
+        blendDesc.RenderTarget[0].SrcBlendAlpha = D3D11_BLEND_ONE;
+        blendDesc.RenderTarget[0].DestBlendAlpha = D3D11_BLEND_ZERO;
+        blendDesc.RenderTarget[0].BlendOpAlpha = D3D11_BLEND_OP_ADD;
+        blendDesc.RenderTarget[0].RenderTargetWriteMask = D3D11_COLOR_WRITE_ENABLE_ALL;
+        
+        Device->CreateBlendState(&blendDesc, &BlendState);
+    }
+
     void ReleaseTexture()
     {
+        if (BlendState)
+        {
+            BlendState->Release();
+            BlendState = nullptr;
+        }
         if (TextureSampler)
         {
             TextureSampler->Release();
             TextureSampler = nullptr;
+        }
+        if (MonsterTextureSRV)
+        {
+            MonsterTextureSRV->Release();
+            MonsterTextureSRV = nullptr;
         }
         if (TextureSRV)
         {
@@ -271,7 +307,16 @@ public:
         DeviceContext->RSSetState(RasterizerState);
 
         DeviceContext->OMSetRenderTargets(1, &FrameBufferRTV, nullptr);
-        DeviceContext->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+        
+        // 투명도 처리를 위한 블렌드 상태 설정
+        if (BlendState)
+        {
+            DeviceContext->OMSetBlendState(BlendState, nullptr, 0xffffffff);
+        }
+        else
+        {
+            DeviceContext->OMSetBlendState(nullptr, nullptr, 0xffffffff);
+        }
     }
 
     void PrepareShader()
@@ -292,7 +337,504 @@ public:
         DeviceContext->Draw(numVertices, 0);
     }
 };
-// 간단한 WIC 로더: 파일을 32bpp BGRA로 변환해 텍스처/ SRV 생성
+
+// 카메라 시스템
+struct FCamera
+{
+    float PositionX;  // 카메라 월드 X 위치
+    float PositionY;  // 카메라 월드 Y 위치
+    float ViewWidth;  // 뷰포트 너비
+    float ViewHeight; // 뷰포트 높이
+    
+    FCamera() : PositionX(0.0f), PositionY(0.0f), ViewWidth(4.0f), ViewHeight(3.0f) {}
+    
+    // 월드 좌표를 화면 좌표로 변환
+    void WorldToScreen(float worldX, float worldY, float& screenX, float& screenY)
+    {
+        screenX = (worldX - PositionX) / (ViewWidth * 0.5f);
+        screenY = (worldY - PositionY) / (ViewHeight * 0.5f);
+    }
+    
+    // 화면 좌표를 월드 좌표로 변환
+    void ScreenToWorld(float screenX, float screenY, float& worldX, float& worldY)
+    {
+        worldX = screenX * (ViewWidth * 0.5f) + PositionX;
+        worldY = screenY * (ViewHeight * 0.5f) + PositionY;
+    }
+    
+    // 플레이어를 따라가도록 카메라 위치 업데이트
+    void FollowPlayer(float playerX, float playerY)
+    {
+        // 부드러운 카메라 이동 (선형 보간)
+        float targetX = playerX;
+        float targetY = playerY;
+        
+        PositionX += (targetX - PositionX) * 0.1f;
+        PositionY += (targetY - PositionY) * 0.1f;
+    }
+};
+
+// 콜라이더 구조체
+struct FCollider
+{
+    float centerX, centerY;  // 중심점
+    float halfWidth, halfHeight;  // 반폭, 반높이
+    
+    FCollider(float x = 0.0f, float y = 0.0f, float w = 0.0f, float h = 0.0f)
+        : centerX(x), centerY(y), halfWidth(w), halfHeight(h) {}
+    
+    // AABB 충돌 감지
+    bool CheckCollision(const FCollider& other) const
+    {
+        return (abs(centerX - other.centerX) < (halfWidth + other.halfWidth)) &&
+               (abs(centerY - other.centerY) < (halfHeight + other.halfHeight));
+    }
+    
+    // 위치 업데이트
+    void UpdatePosition(float x, float y)
+    {
+        centerX = x;
+        centerY = y;
+    }
+};
+
+// 게임 오브젝트 타입
+enum class EGameObjectType
+{
+    Player,
+    Monster,
+    Attack,
+};
+
+// 기본 게임 오브젝트 클래스
+class UGameObject
+{
+public:
+    EGameObjectType Type;
+    float PositionX, PositionY;  // 월드 좌표
+    float ScaleX, ScaleY;
+    FCollider Collider;
+    bool bIsActive;
+    bool bFacingRight;  // 오른쪽을 보고 있는지 (던파 스타일)
+    
+    UGameObject(EGameObjectType type, float x = 0.0f, float y = 0.0f, float sx = 0.5f, float sy = 0.5f)
+        : Type(type), PositionX(x), PositionY(y), ScaleX(sx), ScaleY(sy), bIsActive(true), bFacingRight(true)
+    {
+        Collider = FCollider(x, y, sx, sy);
+    }
+    
+    virtual void Update(float deltaTime) {}
+    virtual void Render(URenderer& renderer, FCamera& camera);
+    
+    void UpdateCollider()
+    {
+        Collider.UpdatePosition(PositionX, PositionY);
+    }
+    
+    // 방향 전환
+    void SetFacingRight(bool facingRight)
+    {
+        bFacingRight = facingRight;
+    }
+};
+
+// 허수아비 몬스터 클래스
+class UMonster : public UGameObject
+{
+public:
+    float Health;
+    float MaxHealth;
+    bool bIsAlive;
+    float MoveSpeed;
+    float Direction;  // 이동 방향 (-1 또는 1)
+    
+    UMonster(float x = 0.0f, float y = 0.0f) 
+        : UGameObject(EGameObjectType::Monster, x, y, 0.4f, 0.6f)
+        , Health(100.0f), MaxHealth(100.0f), bIsAlive(true), MoveSpeed(1.0f), Direction(-1.0f)
+    {
+        UpdateCollider();
+    }
+    
+    void TakeDamage(float damage)
+    {
+        Health -= damage;
+        if (Health <= 0.0f)
+        {
+            Health = 0.0f;
+            bIsAlive = false;
+            bIsActive = false;
+        }
+    }
+    
+    void Update(float deltaTime) override
+    {
+        if (!bIsAlive) return;
+        
+        // 벨트 위에서 좌우로 이동
+        PositionX += Direction * MoveSpeed * deltaTime;
+        
+        // 화면 경계에서 방향 전환
+        if (PositionX < -2.0f || PositionX > 2.0f)
+        {
+            Direction *= -1.0f;
+            bFacingRight = Direction > 0.0f;
+        }
+        
+        UpdateCollider();
+    }
+    
+    void Render(URenderer& renderer, FCamera& camera) override;
+};
+
+// 공격 오브젝트 클래스
+class UAttackObject : public UGameObject
+{
+public:
+    float Damage;
+    float LifeTime;
+    float CurrentLifeTime;
+    UGameObject* Owner;
+    float AttackRange;
+    float AttackDirection;  // 공격 방향 (-1 또는 1)
+    
+    UAttackObject(float x, float y, float damage, UGameObject* owner, float direction)
+        : UGameObject(EGameObjectType::Attack, x, y, 0.3f, 0.3f)
+        , Damage(damage), LifeTime(0.2f), CurrentLifeTime(0.0f), Owner(owner)
+        , AttackRange(0.8f), AttackDirection(direction)
+    {
+        // 공격 방향에 따라 위치 조정
+        PositionX += AttackDirection * AttackRange * 0.5f;
+        UpdateCollider();
+    }
+    
+    void Update(float deltaTime) override
+    {
+        CurrentLifeTime += deltaTime;
+        
+        // 공격 애니메이션 효과 (크기 변화)
+        float progress = CurrentLifeTime / LifeTime;
+        float scaleMultiplier = 1.0f + sin(progress * 3.14159f * 2.0f) * 0.3f;
+        ScaleX = 0.15f * scaleMultiplier;
+        ScaleY = 0.15f * scaleMultiplier;
+        
+        // 공격이 진행되면서 앞으로 이동
+        PositionX += AttackDirection * 1.5f * deltaTime;
+        
+        if (CurrentLifeTime >= LifeTime)
+        {
+            bIsActive = false;
+        }
+        UpdateCollider();
+    }
+    
+    void Render(URenderer& renderer, FCamera& camera) override;
+};
+
+// 플레이어 클래스
+class UPlayer : public UGameObject
+{
+public:
+    float VelocityY;
+    float AttackCooldown;
+    float CurrentAttackCooldown;
+    float MoveSpeed;
+    bool bOnGround;
+    float GroundY;  // 바닥 Y 좌표
+    
+    UPlayer(float x = 0.0f, float y = 0.0f)
+        : UGameObject(EGameObjectType::Player, x, y, 0.4f, 0.6f)
+        , VelocityY(0.0f), AttackCooldown(0.3f), CurrentAttackCooldown(0.0f)
+        , MoveSpeed(3.0f), bOnGround(false), GroundY(0.0f)
+    {
+        UpdateCollider();
+    }
+    
+    void Update(float deltaTime) override
+    {
+        if (CurrentAttackCooldown > 0.0f)
+        {
+            CurrentAttackCooldown -= deltaTime;
+        }
+        
+        // 중력 적용
+        if (!bOnGround)
+        {
+            VelocityY -= 8.0f * deltaTime;  // 중력
+            PositionY += VelocityY * deltaTime;
+            
+            // 바닥에 착지
+            if (PositionY <= GroundY)
+            {
+                PositionY = GroundY;
+                VelocityY = 0.0f;
+                bOnGround = true;
+            }
+        }
+        
+        UpdateCollider();
+    }
+    
+    void MoveLeft(float deltaTime)
+    {
+        PositionX -= MoveSpeed * deltaTime;
+        bFacingRight = false;
+    }
+    
+    void MoveRight(float deltaTime)
+    {
+        PositionX += MoveSpeed * deltaTime;
+        bFacingRight = true;
+    }
+    
+    void Jump()
+    {
+        if (bOnGround)
+        {
+            VelocityY = 4.0f;
+            bOnGround = false;
+        }
+    }
+    
+    bool CanAttack() const
+    {
+        return CurrentAttackCooldown <= 0.0f;
+    }
+    
+    void StartAttackCooldown()
+    {
+        CurrentAttackCooldown = AttackCooldown;
+    }
+    
+    float GetAttackDirection() const
+    {
+        return bFacingRight ? 1.0f : -1.0f;
+    }
+    
+    void Render(URenderer& renderer, FCamera& camera) override;
+};
+
+
+// UGameObject Render 함수 구현
+void UGameObject::Render(URenderer& renderer, FCamera& camera)
+{
+    // 기본 구현은 비어있음
+}
+
+void UMonster::Render(URenderer& renderer, FCamera& camera)
+{
+    if (!bIsActive) return;
+    
+    // 월드 좌표를 화면 좌표로 변환
+    float screenX, screenY;
+    camera.WorldToScreen(PositionX, PositionY, screenX, screenY);
+    
+    // 상수 버퍼 업데이트
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(renderer.DeviceContext->Map(renderer.ConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    {
+        float* cb = (float*)mapped.pData;
+        cb[0] = screenX; cb[1] = screenY; cb[2] = ScaleX; cb[3] = ScaleY;
+        renderer.DeviceContext->Unmap(renderer.ConstantBuffer, 0);
+    }
+    
+    // 몬스터 전용 텍스처 사용
+    if (renderer.MonsterTextureSRV)
+    {
+        renderer.DeviceContext->PSSetShaderResources(0, 1, &renderer.MonsterTextureSRV);
+    }
+    
+    // 렌더링
+    renderer.RenderPrimitive(renderer.VertexBuffer, 6);
+}
+
+void UAttackObject::Render(URenderer& renderer, FCamera& camera)
+{
+    if (!bIsActive) return;
+    
+    // 월드 좌표를 화면 좌표로 변환
+    float screenX, screenY;
+    camera.WorldToScreen(PositionX, PositionY, screenX, screenY);
+    
+    // 상수 버퍼 업데이트
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(renderer.DeviceContext->Map(renderer.ConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    {
+        float* cb = (float*)mapped.pData;
+        cb[0] = screenX; cb[1] = screenY; cb[2] = ScaleX; cb[3] = ScaleY;
+        renderer.DeviceContext->Unmap(renderer.ConstantBuffer, 0);
+    }
+    
+    // 스킬 텍스처 사용 (Skill.gif)
+    if (renderer.SkillTextureSRV)
+    {
+        renderer.DeviceContext->PSSetShaderResources(0, 1, &renderer.SkillTextureSRV);
+    }
+    
+    renderer.RenderPrimitive(renderer.VertexBuffer, 6);
+}
+
+void UPlayer::Render(URenderer& renderer, FCamera& camera)
+{
+    // 월드 좌표를 화면 좌표로 변환
+    float screenX, screenY;
+    camera.WorldToScreen(PositionX, PositionY, screenX, screenY);
+    
+    // 상수 버퍼 업데이트
+    D3D11_MAPPED_SUBRESOURCE mapped{};
+    if (SUCCEEDED(renderer.DeviceContext->Map(renderer.ConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
+    {
+        float* cb = (float*)mapped.pData;
+        cb[0] = screenX; cb[1] = screenY; cb[2] = ScaleX; cb[3] = ScaleY;
+        renderer.DeviceContext->Unmap(renderer.ConstantBuffer, 0);
+    }
+    
+    // 플레이어 텍스처 사용
+    if (renderer.TextureSRV)
+    {
+        renderer.DeviceContext->PSSetShaderResources(0, 1, &renderer.TextureSRV);
+    }
+    
+    renderer.RenderPrimitive(renderer.VertexBuffer, 6);
+}
+
+// 게임 오브젝트 관리자
+class UGameObjectManager
+{
+public:
+    std::vector<UGameObject*> GameObjects;
+    UPlayer* Player;
+    
+    UGameObjectManager() : Player(nullptr) {}
+    
+    ~UGameObjectManager()
+    {
+        for (auto obj : GameObjects)
+        {
+            delete obj;
+        }
+        GameObjects.clear();
+    }
+    
+    void AddGameObject(UGameObject* obj)
+    {
+        GameObjects.push_back(obj);
+        if (obj->Type == EGameObjectType::Player)
+        {
+            Player = static_cast<UPlayer*>(obj);
+        }
+    }
+    
+    void RemoveGameObject(UGameObject* obj)
+    {
+        auto it = std::find(GameObjects.begin(), GameObjects.end(), obj);
+        if (it != GameObjects.end())
+        {
+            GameObjects.erase(it);
+            delete obj;
+        }
+    }
+    
+    void Update(float deltaTime)
+    {
+        // 비활성 오브젝트 제거
+        for (auto it = GameObjects.begin(); it != GameObjects.end();)
+        {
+            if (!(*it)->bIsActive)
+            {
+                delete *it;
+                it = GameObjects.erase(it);
+            }
+            else
+            {
+                (*it)->Update(deltaTime);
+                ++it;
+            }
+        }
+        
+        // 충돌 처리
+        ProcessCollisions();
+    }
+    
+    void Render(URenderer& renderer, FCamera& camera)
+    {
+        for (auto obj : GameObjects)
+        {
+            if (obj->bIsActive)
+            {
+                obj->Render(renderer, camera);
+            }
+        }
+    }
+    
+    void ProcessCollisions()
+    {
+        for (size_t i = 0; i < GameObjects.size(); ++i)
+        {
+            for (size_t j = i + 1; j < GameObjects.size(); ++j)
+            {
+                UGameObject* obj1 = GameObjects[i];
+                UGameObject* obj2 = GameObjects[j];
+                
+                if (!obj1->bIsActive || !obj2->bIsActive) continue;
+                
+                // 충돌 감지
+                if (obj1->Collider.CheckCollision(obj2->Collider))
+                {
+                    HandleCollision(obj1, obj2);
+                }
+            }
+        }
+    }
+    
+    void HandleCollision(UGameObject* obj1, UGameObject* obj2)
+    {
+        // 공격 오브젝트와 몬스터 충돌
+        if ((obj1->Type == EGameObjectType::Attack && obj2->Type == EGameObjectType::Monster) ||
+            (obj1->Type == EGameObjectType::Monster && obj2->Type == EGameObjectType::Attack))
+        {
+            UAttackObject* attack = nullptr;
+            UMonster* monster = nullptr;
+            
+            if (obj1->Type == EGameObjectType::Attack)
+            {
+                attack = static_cast<UAttackObject*>(obj1);
+                monster = static_cast<UMonster*>(obj2);
+            }
+            else
+            {
+                attack = static_cast<UAttackObject*>(obj2);
+                monster = static_cast<UMonster*>(obj1);
+            }
+            
+            // 몬스터에게 데미지
+            monster->TakeDamage(attack->Damage);
+            
+            // 공격 오브젝트 제거
+            attack->bIsActive = false;
+        }
+    }
+    
+    void CreateAttack(float x, float y, float damage, UGameObject* owner, float direction)
+    {
+        UAttackObject* attack = new UAttackObject(x, y, damage, owner, direction);
+        AddGameObject(attack);
+    }
+    
+    std::vector<UMonster*> GetMonsters()
+    {
+        std::vector<UMonster*> monsters;
+        for (auto obj : GameObjects)
+        {
+            if (obj->Type == EGameObjectType::Monster && obj->bIsActive)
+            {
+                monsters.push_back(static_cast<UMonster*>(obj));
+            }
+        }
+        return monsters;
+    }
+};
+
+// WIC 로더: 파일을 32bpp BGRA로 변환해 텍스처/ SRV 생성
 HRESULT CreateTextureFromFileWIC(ID3D11Device* device, ID3D11DeviceContext* context, const wchar_t* path, ID3D11ShaderResourceView** outSRV)
 {
     *outSRV = nullptr;
@@ -330,7 +872,7 @@ HRESULT CreateTextureFromFileWIC(ID3D11Device* device, ID3D11DeviceContext* cont
     texDesc.Height = height;
     texDesc.MipLevels = 0; // 전체 밉체인 자동 생성
     texDesc.ArraySize = 1;
-    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;
+    texDesc.Format = DXGI_FORMAT_B8G8R8A8_UNORM_SRGB;  // BGRA 포맷으로 알파 채널 포함
     texDesc.SampleDesc.Count = 1;
     texDesc.Usage = D3D11_USAGE_DEFAULT;
     texDesc.BindFlags = D3D11_BIND_SHADER_RESOURCE | D3D11_BIND_RENDER_TARGET;
@@ -511,12 +1053,20 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // 텍스처 로드 및 샘플러 생성
     renderer.CreateTextureSampler();
-    // DDS(BC1/BC3) 로드
+    renderer.CreateBlendState();  // 투명도 처리를 위한 블렌드 상태 생성
+    
+    // 플레이어 텍스처 로드
     if (FAILED(CreateTextureFromFileDDS(renderer.Device, L"Sprites/Character.dds", &renderer.TextureSRV)))
     {
         // 폴백: 기존 WIC 로더
         CreateTextureFromFileWIC(renderer.Device, renderer.DeviceContext, L"Sprites/Character.jpg", &renderer.TextureSRV);
     }
+    
+    // 몬스터 텍스처 로드 (PNG 투명도 지원)
+    CreateTextureFromFileWIC(renderer.Device, renderer.DeviceContext, L"Sprites/Monster.png", &renderer.MonsterTextureSRV);
+    
+    // 스킬 텍스처 로드 (공격 이펙트용)
+    CreateTextureFromFileWIC(renderer.Device, renderer.DeviceContext, L"Sprites/Skill.gif", &renderer.SkillTextureSRV);
 
     // 상수 버퍼 생성 (Offset.xy, Scale.xy)
     {
@@ -548,19 +1098,35 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     D3D11_SUBRESOURCE_DATA vertexbufferSRD = { quad };
 
-    ID3D11Buffer* vertexBuffer;
+    renderer.Device->CreateBuffer(&vertexbufferdesc, &vertexbufferSRD, &renderer.VertexBuffer);
 
-    renderer.Device->CreateBuffer(&vertexbufferdesc, &vertexbufferSRD, &vertexBuffer);
+    // 게임 오브젝트 관리자 생성
+    UGameObjectManager gameManager;
+    
+    // 카메라 생성
+    FCamera camera;
+    
+    // 플레이어 생성
+    UPlayer* player = new UPlayer(0.0f, 0.0f);
+    player->GroundY = 0.0f;
+    player->bOnGround = true;
+    gameManager.AddGameObject(player);
+    
+    // 몬스터 생성
+    UMonster* monster1 = new UMonster(2.0f, 0.0f);
+    UMonster* monster2 = new UMonster(-2.0f, 0.0f);
+    UMonster* monster3 = new UMonster(4.0f, 0.0f);
+    UMonster* monster4 = new UMonster(-4.0f, 0.0f);
+    gameManager.AddGameObject(monster1);
+    gameManager.AddGameObject(monster2);
+    gameManager.AddGameObject(monster3);
+    gameManager.AddGameObject(monster4);
 
-    // 이동/점프 상태 변수
-    float posX = 0.0f;   // NDC 기준 위치
-    float posY = 0.0f;
-    float scaleX = 0.25f; // 화면에서 보이는 스프라이트 크기
-    float scaleY = 0.25f;
-    float velocityY = 0.0f;
+    // 게임 상수
     const float gravity = -2.5f;   // 초당 중력 가속
     const float jumpSpeed = 1.6f;  // 점프 초기 속도
     const float moveSpeed = 1.6f;  // 좌우 이동 속도
+    const float attackDamage = 25.0f; // 공격 데미지
 
     // 시간 측정용
     LARGE_INTEGER freq; QueryPerformanceFrequency(&freq);
@@ -595,59 +1161,40 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
         prev = now;
 
         // 입력 처리
-        SHORT left  = GetAsyncKeyState(VK_LEFT);
-        SHORT right = GetAsyncKeyState(VK_RIGHT);
-        SHORT up    = GetAsyncKeyState(VK_UP);
-        SHORT down  = GetAsyncKeyState(VK_DOWN);
-        SHORT space = GetAsyncKeyState(VK_SPACE);
+        SHORT left  = GetAsyncKeyState(VK_LEFT) | GetAsyncKeyState('A');
+        SHORT right = GetAsyncKeyState(VK_RIGHT) | GetAsyncKeyState('D');
+        SHORT jump  = GetAsyncKeyState(VK_SPACE);
+        SHORT attack = GetAsyncKeyState('Z'); // Z키로 공격
 
-        if (left & 0x8000)  posX -= moveSpeed * dt;
-        if (right & 0x8000) posX += moveSpeed * dt;
-        if (down & 0x8000)  posY -= moveSpeed * dt;
-        if (up & 0x8000)    posY += moveSpeed * dt;
+        // 플레이어 이동 처리
+        if (left & 0x8000)  player->MoveLeft(dt);
+        if (right & 0x8000) player->MoveRight(dt);
 
-        // 스페이스 점프(바닥에 있을 때만)
-        bool onGround = (posY - scaleY) <= -1.0f;
-        if (onGround)
+        // 점프 처리
+        if (jump & 0x8000) player->Jump();
+
+        // 공격 처리
+        if ((attack & 0x8000) && player->CanAttack())
         {
-            posY = -1.0f + scaleY; // 바닥에 스냅
-            velocityY = 0.0f;
-            if (space & 0x8000) velocityY = jumpSpeed;
-        }
-        else
-        {
-            // 중력 적용
-            velocityY += gravity * dt;
+            // 플레이어가 바라보는 방향으로 공격
+            float attackDirection = player->GetAttackDirection();
+            gameManager.CreateAttack(player->PositionX, player->PositionY, attackDamage, player, attackDirection);
+            player->StartAttackCooldown();
         }
 
-        // 수직 이동에 속도 반영
-        posY += velocityY * dt;
+        // 카메라가 플레이어를 따라가도록 업데이트
+        camera.FollowPlayer(player->PositionX, player->PositionY);
 
-        // 화면 경계(NDC) 클램프: 스케일을 고려해 스프라이트가 화면 밖으로 안 나가도록
-        float halfW = scaleX;
-        float halfH = scaleY;
-        if (posX - halfW < -1.0f) posX = -1.0f + halfW;
-        if (posX + halfW >  1.0f) posX =  1.0f - halfW;
-        if (posY - halfH < -1.0f) posY = -1.0f + halfH;
-        if (posY + halfH >  1.0f) posY =  1.0f - halfH;
-
-        // 상수 버퍼 업데이트(Offset.xy, Scale.xy)
-        {
-            D3D11_MAPPED_SUBRESOURCE mapped{};
-            if (SUCCEEDED(renderer.DeviceContext->Map(renderer.ConstantBuffer, 0, D3D11_MAP_WRITE_DISCARD, 0, &mapped)))
-            {
-                float* cb = (float*)mapped.pData;
-                cb[0] = posX; cb[1] = posY; cb[2] = scaleX; cb[3] = scaleY;
-                renderer.DeviceContext->Unmap(renderer.ConstantBuffer, 0);
-            }
-        }
+        // 게임 오브젝트 업데이트
+        gameManager.Update(dt);
 
         // 준비 작업
         renderer.Prepare();
         renderer.PrepareShader();
 
-        // 생성한 버텍스 버퍼를 넘겨 실질적인 렌더링 요청
-        renderer.RenderPrimitive(vertexBuffer, numVertices);
+        // 게임 오브젝트들 렌더링
+        gameManager.Render(renderer, camera);
+        
         // 현재 화면에 보여지는 버퍼와 그리기 작업을 위한 버퍼를 서로 교환
         renderer.SwapBuffer();
 
@@ -658,7 +1205,7 @@ int WINAPI WinMain(HINSTANCE hInstance, HINSTANCE hPrevInstance, LPSTR lpCmdLine
 
     // D3D11 소멸 시키는 함수를 호출.
 
-    vertexBuffer->Release();
+    if (renderer.VertexBuffer) { renderer.VertexBuffer->Release(); renderer.VertexBuffer = nullptr; }
     renderer.ReleaseTexture();
     renderer.ReleaseShader();
     renderer.Release();
